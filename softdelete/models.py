@@ -1,21 +1,23 @@
 from __future__ import unicode_literals
 
-import django
+import logging
 
+import django
 from django.conf import settings
-from django.db.models import query
-from django.db import models
-from django.core.exceptions import ObjectDoesNotExist
+from django.contrib.auth.models import Group, Permission
 from django.contrib.contenttypes.models import ContentType
-from django.utils.encoding import python_2_unicode_compatible
+from django.core.exceptions import ObjectDoesNotExist
+from django.db import models
+from django.db.models import query
+from django.utils import timezone
+from six import python_2_unicode_compatible
+
+from softdelete.signals import *
+
 try:
     from django.contrib.contenttypes.fields import GenericForeignKey
 except ImportError:
     from django.contrib.contenttypes.generic import GenericForeignKey
-from django.contrib.auth.models import Group, Permission
-from django.utils import timezone
-import logging
-from softdelete.signals import *
 
 try:
     USE_SOFTDELETE_GROUP = settings.USE_SOFTDELETE_GROUP
