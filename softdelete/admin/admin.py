@@ -29,7 +29,7 @@ class SoftDeleteObjectInline(admin.TabularInline):
 
 class SoftDeleteObjectAdmin(admin.ModelAdmin):
     form = SoftDeleteObjectAdminForm
-    actions = ['delete_selected', 'soft_undelete', 'hard_delete']
+    actions = ['soft_undelete']
 
     def delete_selected(self, request, queryset):
         queryset.delete()
