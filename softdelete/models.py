@@ -1,23 +1,20 @@
 from __future__ import unicode_literals
 
-import logging
-
 import django
+
 from django.conf import settings
-from django.contrib.auth.models import Group, Permission
-from django.contrib.contenttypes.models import ContentType
+from django.db.models import query, OneToOneRel
+from django.db import models, transaction
 from django.core.exceptions import ObjectDoesNotExist
-from django.db import models
-from django.db.models import query
-from django.utils import timezone
-from six import python_2_unicode_compatible
-
-from softdelete.signals import *
-
+from django.contrib.contenttypes.models import ContentType
 try:
     from django.contrib.contenttypes.fields import GenericForeignKey
 except ImportError:
     from django.contrib.contenttypes.generic import GenericForeignKey
+from django.contrib.auth.models import Group, Permission
+from django.utils import timezone
+import logging
+from softdelete.signals import *
 
 try:
     USE_SOFTDELETE_GROUP = settings.USE_SOFTDELETE_GROUP
@@ -99,13 +96,15 @@ class SoftDeleteManager(models.Manager):
     def get_query_set(self):
         qs = super(SoftDeleteManager, self).get_query_set().filter(
             deleted_at__isnull=True)
-        qs.__class__ = SoftDeleteQuerySet
+        if not issubclass(qs.__class__, SoftDeleteQuerySet):
+            qs.__class__ = SoftDeleteQuerySet
         return qs
 
     def get_queryset(self):
         qs = super(SoftDeleteManager, self).get_queryset().filter(
             deleted_at__isnull=True)
-        qs.__class__ = SoftDeleteQuerySet
+        if not issubclass(qs.__class__, SoftDeleteQuerySet):
+            qs.__class__ = SoftDeleteQuerySet
         return qs
 
     def all_with_deleted(self, prt=False):
@@ -113,12 +112,14 @@ class SoftDeleteManager(models.Manager):
             qs = self._get_base_queryset().filter(**self.core_filters)
         else:
             qs = self._get_base_queryset()
-        qs.__class__ = SoftDeleteQuerySet
+        if not issubclass(qs.__class__, SoftDeleteQuerySet):
+            qs.__class__ = SoftDeleteQuerySet
         return qs
 
     def deleted_set(self):
-        qs = self._get_base_queryset().filter(deleted_at__isnull=0)
-        qs.__class__ = SoftDeleteQuerySet
+        qs = self._get_base_queryset().filter(deleted_at__isnull=False)
+        if not issubclass(qs.__class__, SoftDeleteQuerySet):
+            qs.__class__ = SoftDeleteQuerySet
         return qs
 
     def get(self, *args, **kwargs):
@@ -132,12 +133,16 @@ class SoftDeleteManager(models.Manager):
             qs = self.all_with_deleted().filter(*args, **kwargs)
         else:
             qs = self._get_self_queryset().filter(*args, **kwargs)
-        qs.__class__ = SoftDeleteQuerySet
+        if not issubclass(qs.__class__, SoftDeleteQuerySet):
+            qs.__class__ = SoftDeleteQuerySet
         return qs
 
 
 class SoftDeleteObject(models.Model):
-    deleted_at = models.DateTimeField(blank=True, null=True, default=None)
+    deleted_at = models.DateTimeField(
+        blank=True, null=True, default=None,
+        editable=False, db_index=True
+    )
     objects = SoftDeleteManager()
 
     class Meta:
@@ -178,13 +183,25 @@ class SoftDeleteObject(models.Model):
                 getattr(self, rel).all().delete(changeset=changeset)
         except:
             try:
-                getattr(self, rel).all().delete()
-            except:
-                try:
-                    getattr(self, rel).__class__.objects.all().delete(
-                        changeset=changeset)
-                except:
-                    getattr(self, rel).__class__.objects.all().delete()
+                if related.one_to_one:
+                    getattr(self, rel).delete()
+                else:
+                    getattr(self, rel).all().delete()
+            except Exception as e:
+                if getattr(settings, "SOFTDELETE_CASCADE_ALLOW_DELETE_ALL", True):
+                    # fallback to delete all objects in the related field's model class
+                    # to maintain previous behaviour (before setting was added)
+                    try:
+                        getattr(self, rel).__class__.objects.all().delete(
+                            changeset=changeset)
+                    except:
+                        getattr(self, rel).__class__.objects.all().delete()
+                else:
+                    raise e
+
+    @transaction.atomic
+    def hard_delete(self, *args, **kwargs):
+        super(SoftDeleteObject, self).delete(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
         if self.deleted_at:
@@ -210,7 +227,7 @@ class SoftDeleteObject(models.Model):
                 except:
                     pass
         else:
-            using = kwargs.get('using', settings.DATABASES['default'])
+            using = kwargs.get('using', 'default')
             models.signals.pre_delete.send(sender=self.__class__,
                                            instance=self,
                                            using=using)
@@ -228,10 +245,23 @@ class SoftDeleteObject(models.Model):
             all_related = [
                 f for f in self._meta.get_fields()
                 if (f.one_to_many or f.one_to_one)
-                and f.auto_created and not f.concrete
+                   and f.auto_created and not f.concrete
             ]
+
             for x in all_related:
-                self._do_delete(cs, x)
+                if x.on_delete.__name__ not in ['DO_NOTHING', 'SET_NULL']:
+                    self._do_delete(cs, x)
+                if x.on_delete.__name__ == 'SET_NULL':
+                    related_name = x.get_accessor_name()
+                    if isinstance(x, OneToOneRel):
+                        if getattr(self, related_name, None) is None:
+                            continue
+                        related = getattr(self, related_name)
+                        if isinstance(related, models.Model):
+                            setattr(related, x.remote_field.name, None)
+                            related.save(update_fields=[x.remote_field.name])
+                    else:
+                        getattr(self, related_name).all().update(**{x.remote_field.name: None})
             logging.debug("FINISHED SOFT DELETING RELATED %s", self)
             models.signals.post_delete.send(sender=self.__class__,
                                             instance=self,
@@ -265,8 +295,10 @@ class SoftDeleteObject(models.Model):
             else:
                 self.delete()
 
-@python_2_unicode_compatible
 class ChangeSet(models.Model):
+    id = models.BigAutoField(
+        auto_created=True, primary_key=True, serialize=False, verbose_name="ID"
+    )
     created_date = models.DateTimeField(default=timezone.now)
     content_type = models.ForeignKey(ContentType, on_delete=models.CASCADE)
     object_id = models.CharField(max_length=100)
@@ -298,8 +330,10 @@ class ChangeSet(models.Model):
 
     content = property(get_content, set_content)
 
-@python_2_unicode_compatible
 class SoftDeleteRecord(models.Model):
+    id = models.BigAutoField(
+        auto_created=True, primary_key=True, serialize=False, verbose_name="ID"
+    )
     changeset = models.ForeignKey(
         ChangeSet,
         related_name='soft_delete_records',
